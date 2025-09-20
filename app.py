@@ -93,4 +93,46 @@ def normalize_query(name: str, phase: Optional[str], material: str, openai_clien
         if s:
             base_terms.append(normalize_korean(s))
 
-    candidates = list(dict.fromkeys([t for t in base]()
+    candidates = list(dict.fromkeys([t for t in base_terms if t]))
+
+    if openai_client:
+        try:
+            sys = "너는 사내 폐기물 용어 표준화 도우미다. 사용자 입력을 표준 용어 후보 JSON 배열로만 반환하라."
+            user = {"name": name, "phase": phase, "material": material}
+            rsp = openai_client.responses.create(
+                model="gpt-4o-mini",
+                input=[
+                    {"role": "system", "content": sys},
+                    {"role": "user", "content": str(user)}
+                ],
+                temperature=0
+            )
+            text = rsp.output_text.strip()
+            if text.startswith("[") and text.endswith("]"):
+                import json
+                arr = json.loads(text)
+                arr = [normalize_korean(str(x)) for x in arr if str(x).strip()]
+                candidates = list(dict.fromkeys(candidates + arr))
+        except Exception:
+            pass
+
+    return candidates or [normalize_korean(name)]
+
+def _score_series(series: pd.Series, query: str) -> List[Tuple[int, float]]:
+    """series(폐기물 종류) 각 항목과 query 유사도 계산 → (index, score)"""
+    scores = []
+    qn = normalize_korean(query)
+    for idx, val in series.items():
+        s = normalize_korean(val)
+        score = fuzz.WRatio(qn, s)
+        scores.append((idx, float(score)))
+    return scores
+
+def search_best(df_main: pd.DataFrame, query_terms: List[str], threshold: int = FUZZ_THRESHOLD) -> Tuple[Optional[pd.Series], Dict[str, Any]]:
+    """정확/부분 일치 우선 → 퍼지 매칭 보조"""
+    col_name, col_method = "폐기물 종류", "처리 방법"
+    debug: Dict[str, Any] = {"match_type": "", "score": 0.0, "candidates": []}
+
+    # 1) 정확/부분 일치
+    for q in query_terms:
+        exact = df_main[df_main[col_name].str.strip().str.lower() ==_]()_]()_
