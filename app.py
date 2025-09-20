@@ -13,32 +13,31 @@ from rapidfuzz import fuzz
 # 설정
 # =========================================
 APP_TITLE = "사내 폐기물 처리방법 조회"
-DEFAULT_XLSX = "wasteinfo.xlsx"  # 리포지토리 루트에 배치
+DEFAULT_XLSX = "wasteinfo.xlsx"   # GitHub repo 루트에 wasteinfo.xlsx 업로드 필요
 
 # =========================================
 # 유틸
 # =========================================
 def normalize_korean(s: str) -> str:
+    """NFKC 정규화 + 공백 정리"""
     s = unicodedata.normalize("NFKC", str(s))
     s = s.replace("\u3000", " ")
     s = re.sub(r"\s+", " ", s)
     return s.strip()
 
-def get_dept_from_row(row: pd.Series) -> str:
-    # '부서' 관련 컬럼 탐색(예: '부서', '담당 부서', '처리부서')
-    for c in row.index:
-        if "부서" in str(c):
-            v = str(row[c]).strip()
-            if v and v != "nan":
-                return v
-    return ""
+def pick_first_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    """데이터프레임에서 후보 컬럼명 중 첫 번째로 존재하는 컬럼 반환"""
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
 
 # =========================================
 # 데이터 로딩
 # =========================================
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df.columns = [c.strip() for c in df.columns]
+    df.columns = [c.strip() for c in df.columns]  # '처리 방법 ' → '처리 방법'
     return df
 
 @st.cache_data(show_spinner=False)
@@ -61,10 +60,11 @@ def load_data(xlsx_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
             raise ValueError(f"참고 시트에 '{req}' 컬럼이 없습니다.")
 
     # 문자열 정리
-    for c in ["폐기물 종류", "처리 방법"]:
-        df_main[c] = df_main[c].astype(str).str.strip()
-    for c in ["구분", "폐기물 종류", "처리 방법"]:
-        df_ref[c] = df_ref[c].astype(str).str.strip()
+    df_main["폐기물 종류"] = df_main["폐기물 종류"].astype(str).str.strip()
+    df_main["처리 방법"]   = df_main["처리 방법"].astype(str).str.strip()
+    df_ref["구분"]        = df_ref["구분"].astype(str).str.strip()
+    df_ref["폐기물 종류"]  = df_ref["폐기물 종류"].astype(str).str.strip()
+    df_ref["처리 방법"]    = df_ref["처리 방법"].astype(str).str.strip()
 
     return df_main, df_ref
 
@@ -72,21 +72,26 @@ def load_data(xlsx_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
 # 매칭/검색
 # =========================================
 def normalize_query(name: str, phase: Optional[str], material: str, openai_client=None) -> List[str]:
+    """
+    기본 후보: [폐기물명, 재질, 성상]
+    OpenAI가 있으면 동의어/오타 보정 후보를 JSON 배열로 받아 추가.
+    """
     base_terms = []
     for s in [name, material, phase or ""]:
         s = (s or "").strip()
         if s:
             base_terms.append(normalize_korean(s))
+
     candidates = list(dict.fromkeys([t for t in base_terms if t]))
 
     if openai_client:
         try:
-            sys_msg = "너는 사내 폐기물 용어 표준화 도우미다. 사용자 입력을 표준 용어 후보 JSON 배열로만 반환하라."
+            sys = "너는 사내 폐기물 용어 표준화 도우미다. 사용자 입력을 표준 용어 후보 JSON 배열로만 반환하라."
             user = {"name": name, "phase": phase, "material": material}
             rsp = openai_client.responses.create(
                 model="gpt-4o-mini",
                 input=[
-                    {"role": "system", "content": sys_msg},
+                    {"role": "system", "content": sys},
                     {"role": "user", "content": str(user)}
                 ],
                 temperature=0
@@ -99,9 +104,11 @@ def normalize_query(name: str, phase: Optional[str], material: str, openai_clien
                 candidates = list(dict.fromkeys(candidates + arr))
         except Exception:
             pass
+
     return candidates or [normalize_korean(name)]
 
 def _score_series(series: pd.Series, query: str) -> List[Tuple[int, float]]:
+    """series(폐기물 종류) 각 항목과 query 유사도 계산 → (index, score)"""
     scores = []
     qn = normalize_korean(query)
     for idx, val in series.items():
@@ -111,19 +118,18 @@ def _score_series(series: pd.Series, query: str) -> List[Tuple[int, float]]:
     return scores
 
 def search_best(df_main: pd.DataFrame, query_terms: List[str], threshold: int = 60) -> Tuple[Optional[pd.Series], Dict[str, Any]]:
+    """정확/부분 일치 우선 → 퍼지 매칭 보조"""
     col_name, col_method = "폐기물 종류", "처리 방법"
     debug: Dict[str, Any] = {"match_type": "", "score": 0.0, "candidates": []}
 
     # 1) 정확/부분 일치
     for q in query_terms:
-        ql = q.strip().lower()
-        exact = df_main[df_main[col_name].str.strip().str.lower() == ql]
+        exact = df_main[df_main[col_name].str.strip().str.lower() == q.strip().lower()]
         if len(exact) > 0:
             row = exact.iloc[0]
             debug["match_type"] = "정확 일치"
             debug["score"] = 100.0
             return row, debug
-
         part = df_main[df_main[col_name].str.contains(q, case=False, na=False)]
         if len(part) > 0:
             row = part.iloc[0]
@@ -138,6 +144,7 @@ def search_best(df_main: pd.DataFrame, query_terms: List[str], threshold: int = 
     all_scores.sort(key=lambda x: -x[1])
     top = all_scores[:10]
 
+    debug["candidates"] = []
     best_row, best_score = None, 0.0
     seen = set()
     for idx, sc in top:
@@ -160,36 +167,27 @@ def search_best(df_main: pd.DataFrame, query_terms: List[str], threshold: int = 
 
     return None, debug
 
-def find_best_ref_one(df_ref: pd.DataFrame, keyword: str) -> Optional[dict]:
-    """'구분'에 '처리기준' 포함 행을 우선 필터 → 유사도 최고 1건 반환. 없으면 전체 중 1건."""
+def find_refs(df_ref: pd.DataFrame, keyword: str, topk: int = 1) -> list[dict]:
+    """법령 참고(별표5)에서 유사 항목 상위 topk 반환(요청에 따라 1건만)"""
     col_name, col_method, col_group = "폐기물 종류", "처리 방법", "구분"
+    scores = []
     key_norm = normalize_korean(keyword)
+    for idx, val in df_ref[col_name].items():
+        s = normalize_korean(val)
+        score = fuzz.WRatio(key_norm, s)
+        scores.append((idx, float(score)))
 
-    def pick_best(sub: pd.DataFrame) -> Optional[dict]:
-        if sub.empty:
-            return None
-        scores = []
-        for idx, val in sub[col_name].items():
-            s = normalize_korean(val)
-            sc = fuzz.WRatio(key_norm, s)
-            scores.append((idx, float(sc)))
-        scores.sort(key=lambda x: -x[1])
-        idx, sc = scores[0]
-        row = sub.loc[idx]
-        return {
+    scores.sort(key=lambda x: -x[1])
+    out = []
+    for idx, sc in scores[:topk]:
+        row = df_ref.loc[idx]
+        out.append({
             "구분": row[col_group],
             "폐기물 종류": row[col_name],
             "처리 방법": row[col_method],
             "score": sc
-        }
-
-    # 1순위: '구분'에 '처리기준' 포함
-    mask = df_ref[col_group].str.contains("처리기준", case=False, na=False)
-    best = pick_best(df_ref[mask])
-    if best:
-        return best
-    # 2순위: 전체 중 1건
-    return pick_best(df_ref)
+        })
+    return out
 
 # =========================================
 # Streamlit App
@@ -202,8 +200,8 @@ if "data_loaded" not in st.session_state:
     st.session_state.df_main = None
     st.session_state.df_ref = None
     st.session_state.xlsx_path = None
-
 if "OPENAI_API_KEY" not in st.session_state:
+    # ① Secrets → ② Env → (없으면 None)
     try:
         secret_key = st.secrets.get("OPENAI_API_KEY", None)
     except Exception:
@@ -227,24 +225,31 @@ def load_app_data(xlsx_path: str):
 with st.sidebar:
     st.header("🔧 시스템 관리")
 
+    # 데이터 로드/새로고침
     if st.button("📊 데이터 불러오기/새로고침", use_container_width=True):
         st.session_state.data_loaded = False
         load_app_data(DEFAULT_XLSX)
         st.rerun()
 
+    # 상태 표시
     if st.session_state.data_loaded:
         st.success("✅ 데이터 로드됨")
         st.info(f"📂 경로: {st.session_state.xlsx_path}")
     else:
         st.warning("⚠️ 데이터 미로드")
 
+    # OpenAI Key: ③ 사이드바 입력(Secrets/Env가 없을 때만 사용)
     st.subheader("🤖 OpenAI 연결 설정")
     if st.session_state.get("OPENAI_API_KEY"):
         st.success("🔑 OpenAI 키가 설정되어 있습니다 (Secrets 또는 Env).")
         st.caption("사이드바 입력은 Secrets/Env가 없을 때만 사용됩니다.")
         api_key_input = ""
     else:
-        api_key_input = st.text_input("OpenAI API Key", type="password", placeholder="sk-...")
+        api_key_input = st.text_input(
+            "OpenAI API Key",
+            type="password",
+            placeholder="sk-로 시작하는 API Key 입력"
+        )
         if api_key_input:
             st.session_state["OPENAI_API_KEY"] = api_key_input
             st.success("🔑 OpenAI 키가 세션에 설정되었습니다.")
@@ -253,13 +258,22 @@ with st.sidebar:
 st.title(APP_TITLE)
 st.markdown("---")
 
+# 첫 로드 시 자동 시도
 if not st.session_state.data_loaded:
     with st.spinner("📊 데이터를 로딩중입니다..."):
         load_app_data(DEFAULT_XLSX)
 
 if st.session_state.data_loaded:
+    # 메타 컬럼 탐지
+    dfm = st.session_state.df_main
+    COL_WASTE = "폐기물 종류"
+    COL_METHOD = "처리 방법"
+    dept_col = pick_first_col(dfm, ["부서","담당 부서","처리 부서","처리방법 부서","관리 부서","부서명"])
+    place_col = pick_first_col(dfm, ["장소","처리 장소","보관 장소","처리 위치","위치"])
+
     st.subheader("🔍 폐기물 정보 입력")
     col1, col2, col3 = st.columns([2, 1, 2])
+
     with col1:
         waste_name = st.text_input("폐기물명 *", placeholder="예: 폐유, 폐페인트 슬러지")
     with col2:
@@ -280,7 +294,7 @@ if st.session_state.data_loaded:
                 try:
                     phase_input = None if phase == "선택안함" else phase
 
-                    # OpenAI client
+                    # OpenAI client: ① Secrets→②Env→③Sidebar 순으로 세팅된 키 사용
                     openai_client = None
                     api_key = st.session_state.get("OPENAI_API_KEY")
                     if api_key:
@@ -292,74 +306,63 @@ if st.session_state.data_loaded:
 
                     # Normalize + 매칭
                     query_terms = normalize_query(waste_name, phase_input, material, openai_client)
-                    best_row, debug_info = search_best(st.session_state.df_main, query_terms)
+                    best_row, debug_info = search_best(dfm, query_terms)
 
                     if best_row is not None:
                         st.subheader("✅ 처리 방법 (사내 기준)")
                         with st.container():
-                            st.success(f"**처리 방법**: {best_row['처리 방법']}")
-                        c1, c2, c3 = st.columns(3)
-                        with c1:
-                            st.info(f"**매칭된 폐기물**: {best_row['폐기물 종류']}")
-                        with c2:
-                            st.info(f"**매칭 방식**: {debug_info.get('match_type')} (유사도: {debug_info.get('score', 0):.1f}%)")
-                        with c3:
-                            dept = get_dept_from_row(best_row)
-                            st.info(f"**부서**: {dept or '정보없음'}")
+                            st.success(f"**처리 방법**: {best_row[COL_METHOD]}")
+                            col_details1, col_details2, col_details3 = st.columns(3)
+                            with col_details1:
+                                st.info(f"**매칭된 폐기물**: {best_row[COL_WASTE]}")
+                            with col_details2:
+                                st.info(f"**매칭 방식**: {debug_info.get('match_type')} (유사도: {debug_info.get('score', 0):.1f}%)")
+                            with col_details3:
+                                if dept_col:
+                                    st.info(f"**부서**: {best_row.get(dept_col, '')}")
+                                else:
+                                    st.caption("부서 컬럼을 찾지 못했습니다.")
 
-                        # 부서가 '환경자원그룹'일 때만 법령참고 1건 노출
-                        if dept == "환경자원그룹":
-                            ref = find_best_ref_one(st.session_state.df_ref, best_row["폐기물 종류"])
-                            if ref:
+                        # ---------- 법령 표출 조건 ----------
+                        # 1) 부서가 환경자원그룹인 경우에만
+                        dept_val = str(best_row.get(dept_col, "")) if dept_col else ""
+                        is_env_group = "환경자원그룹" in dept_val
+
+                        # 2) 중앙야적장/스크랩야드 관련이면 표시 금지
+                        excluded_terms = ["중앙야적장", "스크랩야드"]
+                        place_val = str(best_row.get(place_col, "")) if place_col else ""
+                        method_val = str(best_row.get(COL_METHOD, ""))
+                        row_text_for_exclude = " ".join([place_val, method_val]).strip()
+                        is_excluded_place = any(t in row_text_for_exclude for t in excluded_terms)
+
+                        # 분기
+                        if is_env_group and not is_excluded_place:
+                            refs = find_refs(st.session_state.df_ref, best_row[COL_WASTE], topk=1)
+                            if refs:
                                 st.markdown("---")
-                                st.subheader("📖 법령 참고 (시행규칙 별표5 · 처리기준 및 방법 · 상위 1건)")
+                                st.subheader("📖 법령 참고 (시행규칙 별표5, 1건)")
+                                ref = refs[0]
                                 st.markdown(f"- **구분**: {ref['구분']}")
                                 st.markdown(f"- **폐기물 종류**: {ref['폐기물 종류']}")
-                                st.markdown(f"- **처리 기준·방법**: {ref['처리 방법']}")
+                                st.markdown(f"- **처리 방법**: {ref['처리 방법']}")
                             else:
-                                st.caption("법령참고: 일치 항목 없음")
+                                st.info("별표5에서 연관 항목을 찾지 못했습니다.")
+                        else:
+                            # 조건 미충족 시 비표시
+                            reason = []
+                            if not is_env_group:
+                                reason.append("부서≠환경자원그룹")
+                            if is_excluded_place:
+                                reason.append("중앙야적장/스크랩야드 관련")
+                            st.caption(f"법령 참고 숨김: {', '.join(reason) if reason else '조건 미충족'}")
 
                     else:
-                        # 매칭 실패 → OpenAI로 제안
                         st.error("❌ 일치하는 항목을 찾지 못했습니다.")
                         if debug_info.get("candidates"):
-                            st.subheader("💡 유사 후보(Top)")
+                            st.subheader("💡 유사한 항목들(Top)")
                             for i, c in enumerate(debug_info["candidates"][:5], 1):
                                 st.markdown(f"**{i}. {c['폐기물 종류']}** (유사도: {c['score']:.1f}%)")
-                                st.markdown(f" 처리 방법: {c['처리 방법']}")
-
-                        if openai_client:
-                            try:
-                                sys_msg = (
-                                    "너는 한국의 폐기물관리법 및 하위법령을 잘 아는 전문가다. "
-                                    "입력된 폐기물명/성상/재질을 바탕으로 ‘가능성 높은 처리방법’과 "
-                                    "검토 포인트를 한국어로 간결히 제안하라. "
-                                    "사내 기준이 아님을 명시하지 말고, 법령 일반 원칙 수준에서만 답하라. "
-                                    "목록 3개 이내로."
-                                )
-                                user_msg = {
-                                    "폐기물명": waste_name,
-                                    "성상": phase_input or "",
-                                    "재질": material
-                                }
-                                rsp = openai_client.responses.create(
-                                    model="gpt-4o-mini",
-                                    input=[
-                                        {"role": "system", "content": sys_msg},
-                                        {"role": "user", "content": str(user_msg)}
-                                    ],
-                                    temperature=0.2
-                                )
-                                suggestion = rsp.output_text.strip()
-                                st.markdown("### 🤔 OpenAI 제안(참고용)")
-                                st.warning(
-                                    "이 제안은 모델 생성 결과로 **환각(사실과 다른 내용) 가능성**이 있습니다. "
-                                    "반드시 사내 기준 및 법적 근거를 재검토하세요."
-                                )
-                                st.markdown(suggestion if suggestion else "- 제안 생성 실패")
-                            except Exception as e:
-                                st.caption(f"OpenAI 제안 실패: {e}")
-
+                                st.markdown(f"   처리 방법: {c['처리 방법']}")
                 except Exception as e:
                     st.error(f"❌ 검색 중 오류가 발생했습니다: {str(e)}")
                     with st.expander("상세 오류 정보"):
